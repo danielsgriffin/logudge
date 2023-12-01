@@ -1,31 +1,30 @@
+import toml
 import os
 import re
 import time
 import subprocess
 from collections import defaultdict
 from datetime import datetime, timedelta
-from iterfzf import iterfzf
-import threading
 
 # Constants
 ## Log pattern matches the log timestamp and is used to find the rest of the log line.
 LOG_PATTERN = r"#+\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (.*)"
-SLEEP_INTERVAL = 60 # Sleep for a minute before checking again
 CHECK_INTERVAL = 10 * 60  # Default: 10 minutes
 AUDIO = True
+MONITORING_THRESHOLD = 20  # minutes
 
-# Get the directories from the environment variable
-target_dirs = os.environ.get(
-    "LOGUDGE_TARGET_DIRECTORIES", "").split(";")
 
-# If the environment variable is not set or is empty, fall back to a default list or an empty list
-TARGET_DIRECTORIES = target_dirs if target_dirs[0] else []
+# Load the configuration file from the script's directory
+config = toml.load(os.path.join(os.path.dirname(__file__), "config.toml"))
+
+# Access the directories
+TARGET_DIRECTORIES = config['directories']['target']
 
 if not TARGET_DIRECTORIES:
-    print("TARGET_DIRECTORIES not set. Please set the environment variable and try again. See README.md for more information.")
+    print("LOGUDGE_TARGET_DIRECTORIES not set. Please set the environment variable and try again. See README.md for more information.")
     exit(1)
 
-def find_recent_logs(directory, threshold_time, last_log_file):
+def find_recent_logs(directory, threshold_time, latest_log_file, latest_match):
     """
     Search for recent log entries in the directory
     and return the time of the most recent log entry.
@@ -51,8 +50,10 @@ def find_recent_logs(directory, threshold_time, last_log_file):
                         matches = re.findall(LOG_PATTERN, content)
                         # distinguish between log time and log entry (the two matches)
                         for match in matches:
-                            print(match)
-                            print(type(match))
+                            if match == latest_match:
+                                print(f"No logs since {match[0]}.")
+                            latest_match = match
+                            
                             log_time, log_entry = match
                             log_time = datetime.strptime(log_time, "%Y-%m-%d %H:%M:%S")
                             if log_time > threshold_time:
@@ -62,34 +63,21 @@ def find_recent_logs(directory, threshold_time, last_log_file):
                                     or log_time > most_recent_time
                                 ):
                                     most_recent_time = log_time
-                                    last_log_file = file_name
-    return most_recent_time, logs, last_log_file
-
-
-def get_input(prompt, timeout=60):
-    """
-    Wait for input from the user for the given number of seconds.
-    """
-    result = []
-
-    def worker():
-        result.append(input(prompt))
-
-    thread = threading.Thread(target=worker)
-    thread.start()
-    thread.join(timeout)
-    if thread.is_alive():
-        print("\nTime's up! Exiting.")
-        thread.join()  # If the thread did not finish, wait for it to do so
-        return None
-    else:
-        return result[0]
+                                    latest_log_file = file_name
+    return most_recent_time, logs, latest_log_file, latest_match
 
 
 def main():
     start_time = datetime.now()
-    print(f"Starting Lugudge timer at {start_time}")
-    last_log_file = None
+    # print human-readable start time as hh:mm (24-hour clock)
+    print(f"Starting Lugudge timer at {start_time.strftime('%H:%M')}")
+    
+    # Set initial values
+    latest_log_file = None
+    latest_match = None
+    depth = 1
+    monitoring_silent = False
+
     while True:
         check_time = start_time + timedelta(seconds=CHECK_INTERVAL)
         now = datetime.now()
@@ -99,8 +87,8 @@ def main():
             threshold_time = now - timedelta(seconds=CHECK_INTERVAL)
             most_recent_log_time = None
             for directory in TARGET_DIRECTORIES:
-                recent_log_time, logs, last_log_file = find_recent_logs(
-                    directory, threshold_time, last_log_file
+                recent_log_time, logs, latest_log_file, latest_match = find_recent_logs(
+                    directory, threshold_time, latest_log_file, latest_match
                 )
                 if recent_log_time:
                     if (
@@ -121,42 +109,32 @@ def main():
                 if AUDIO:
                     print("\a") # sound the alert
                     subprocess.run(['say', 'Found recent log, continuing.'])
-                while True:
-                    user_input = get_input(
-                        "Do you want to open the last log file or find a log file to add to? (y/i/x/quit): ",
-                        60,
-                    )
-
-                    if user_input is None:
-                        break
-                    elif user_input.lower() == "y":
-                        subprocess.run(["open", last_log_file])
-                    elif user_input.lower() == "i":
-                        selected_file = iterfzf(logs.keys())
-                        subprocess.run(["open", selected_file])
-                    elif user_input.lower() == "x":
-                        break
-                    elif user_input.lower() == "quit":
-                        exit()
-                    else:
-                        print("Invalid input. Please enter y, i, x, or quit.")
-
+                depth = 1
+                monitoring_silent = False
             else:
+                if monitoring_silent:
+                    continue
+                second_since_last_log = now - start_time
+                minutes_since_last_log = int(second_since_last_log.seconds/60)
+                message = f"No recent logs found in the last {minutes_since_last_log} minutes. Please add a new log."
+                if minutes_since_last_log > MONITORING_THRESHOLD:
+                    monitoring_silent = True
+                    message = f"WARNING: {minutes_since_last_log} minutes exceeds the monitoring threshold. Monitoring will now be silent until a new log has been added."
+
                 if AUDIO:
                     print("\a")  # sound the alert
-                    subprocess.run(
-                        ['say', 'No recent logs found in the last 10 minutes. Please add a new log.'])
-                print(
-                    f"No recent logs found in the last {CHECK_INTERVAL} seconds. Please add a new log."
-                )
+                    subprocess.run(['say', message])
+                print(message)
                 try:
-                    subprocess.run(["open", last_log_file])
+                    subprocess.run(["open", latest_log_file])
+                    print("Opening last log file.")
                 except TypeError:
-                    print("No last_log_file found.")
-                _input = input("Press enter to continue...")
-                start_time = now
-                print(f"Resetting Lugudge timer at {start_time}")
-        time.sleep(SLEEP_INTERVAL)
+                    print("No last log file found.")
+                depth += 1
+        next_check_span = CHECK_INTERVAL / depth
+        # print that the next check is in approximitely x minutes
+        print(f"Next check in about {int(next_check_span/60)} minutes.")
+        time.sleep(next_check_span)
 
 
 if __name__ == "__main__":
